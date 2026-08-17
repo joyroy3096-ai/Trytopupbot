@@ -24,7 +24,7 @@ logging.basicConfig(
 
 # ===== CONFIG =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-MAIN_ADMIN = 8302054030 
+MAIN_ADMIN = 7375002067 
 
 # ===== LIKE API ENDPOINTS =====
 # আগে একটাই fixed URL ("https://topupgang.com/like") ব্যবহার হতো, যেটা
