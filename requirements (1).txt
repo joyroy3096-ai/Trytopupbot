@@ -1,4 +1,0 @@
-python-telegram-bot==21.4
-aiohttp==3.9.5
-pymongo==4.8.0
-flask==3.0.3
