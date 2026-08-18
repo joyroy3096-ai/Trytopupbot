@@ -4,10 +4,11 @@ import json
 import logging
 import os
 import threading
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from flask import Flask
+from flask import Flask, request as flask_request, redirect
 
 from pymongo import MongoClient
 
@@ -23,18 +24,42 @@ logging.basicConfig(
 
 # ===== CONFIG =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-MAIN_ADMIN = 7375002067
+MAIN_ADMIN = 7375002067 
 
-API_URL = "https://api.pinbot.shop/like"
+# ===== LIKE API ENDPOINTS =====
+# আগে একটাই fixed URL ("https://topupgang.com/like") ব্যবহার হতো, যেটা
+# আসলে 404 দিচ্ছিল কারণ real endpoint quality (100/200) অনুযায়ী আলাদা।
+# এখন থেকে 100 Like আর 200 Like এর জন্য আলাদা URL ব্যবহার হবে:
+API_URL_100 = "https://topupgang.com/api/like100"
+API_URL_200 = "https://topupgang.com/api/like200"
 
 # Separate API keys per like tier.
 # API_KEY_100 -> used for /like, /100like, /100auto  (100 Like)
 # API_KEY_200 -> used for /likes, /200like, /200auto, /autolike (200 Like)
-API_KEY_100 = "100like_a637a56c-bdf8-4079-9fac-6173a41f59e8"
-API_KEY_200 = "200like_dd12e9b5-0f16-4506-b0ae-03eb856b63d9"
+API_KEY_100 = "JGS-977A6772FF920F52"
+API_KEY_200 = "JGS-977A6772FF920F52"
 
 REGION = "BD"
-DEFAULT_AUTO_TIME = "08:00"   # default daily run time for auto-like plans (Asia/Dhaka)
+DEFAULT_AUTO_TIME = "09:00"   # default daily run time for auto-like plans (Asia/Dhaka)
+
+# ===== PAYMENT GATEWAY (DarunPay) =====
+# Dashboard: https://pay.darunpay.top
+# Docs: https://pay.darunpay.top/docs
+DARUN_API_KEY    = os.environ.get("DARUN_API_KEY", "")
+DARUN_SECRET_KEY = os.environ.get("DARUN_SECRET_KEY", "")
+DARUN_BRAND_KEY  = os.environ.get("DARUN_BRAND_KEY", "")
+
+DARUN_CREATE_URL = "https://pay.darunpay.top/api/payment/create"
+DARUN_VERIFY_URL = "https://pay.darunpay.top/api/payment/verify"
+
+# তোমার Render app এর base URL — যেমন https://my-bot.onrender.com
+APP_BASE_URL = os.environ.get("APP_BASE_URL", "").rstrip("/")
+
+# Admin credit rate (per credit) — /setrate দিয়ে runtime এ পরিবর্তন করা যাবে
+CREDIT_RATE_PER_UNIT: float = 4.0   # টাকা per credit (default)
+
+# pending_payments[tran_id] = {"user_id", "chat_id", "credit_amount", "amount_tk", "name", "phone"}
+pending_payments: dict = {}
 
 # ===== PERSISTENT STORAGE (MONGODB ATLAS) =====
 # Everything below is kept in memory for speed (same as before), but is now
@@ -83,6 +108,7 @@ _plan_id_counter = 0
 
 def _save_data_sync():
     """Blocking Mongo write. Upserts a single 'state' document holding everything."""
+    global CREDIT_RATE_PER_UNIT
     db = get_db()
     doc = {
         "_id": "bot_state",
@@ -94,6 +120,7 @@ def _save_data_sync():
             for pid, p in autoplans.items()
         },
         "plan_id_counter": _plan_id_counter,
+        "credit_rate": CREDIT_RATE_PER_UNIT,
         "updated_at": datetime.utcnow().isoformat(),
     }
     db.state.replace_one({"_id": "bot_state"}, doc, upsert=True)
@@ -134,6 +161,8 @@ def load_data():
             p["next_run"] = datetime.fromisoformat(p["next_run"])
             autoplans[int(pid)] = p
         _plan_id_counter = data.get("plan_id_counter", 0)
+        if "credit_rate" in data:
+            CREDIT_RATE_PER_UNIT = float(data["credit_rate"])
 
         logging.info("Loaded saved data from MongoDB: %d users, %d groups, %d autoplans",
                      len(users), len(groups), len(autoplans))
@@ -170,7 +199,7 @@ def is_admin(user_id: int) -> bool:
 
 GROUP_LOCKED_MESSAGE = (
     "🔒 এই গ্রুপে বট এখনো Unlock করা হয়নি।\n"
-    "ব্যবহার করতে Admin এর সাথে যোগাযোগ করুন: https://t.me/PrantoLab"
+    "ব্যবহার করতে Admin এর সাথে যোগাযোগ করুন: https://t.me/Itzfuadd"
 )
 
 async def enforce_group_lock(update: Update) -> bool:
@@ -222,12 +251,13 @@ def deduct_credit(mode: str, user: dict, group: dict, cost: int):
     return user["limit"], user["used"]
 
 # ===== LIKE API =====
-async def call_like_api_once(uid: str, api_key: str):
-    """Single API call. Returns (ok, added, name, before, after, error_text)."""
+async def call_like_api_once(uid: str, api_key: str, url: str):
+    """Single API call against the given endpoint. Returns
+    (ok, added, name, before, after, error_text)."""
     try:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(API_URL, params={"playerid": uid, "api_key": api_key}) as response:
+            async with session.get(url, params={"playerid": uid, "api_key": api_key}) as response:
                 if response.status != 200:
                     return False, 0, "", "", "", f"❌ API Error: {response.status}"
 
@@ -257,11 +287,14 @@ async def call_like_api_once(uid: str, api_key: str):
 
 async def call_like_api(uid: str, quality: int):
     """
-    Picks the correct API key for the requested Like tier:
-    100 -> API_KEY_100, 200 -> API_KEY_200
+    Picks the correct endpoint + API key for the requested Like tier:
+    100 -> API_URL_100 + API_KEY_100
+    200 -> API_URL_200 + API_KEY_200
     """
-    api_key = API_KEY_100 if quality == 100 else API_KEY_200
-    return await call_like_api_once(uid, api_key)
+    if quality == 100:
+        return await call_like_api_once(uid, API_KEY_100, API_URL_100)
+    else:
+        return await call_like_api_once(uid, API_KEY_200, API_URL_200)
 
 # ===== SHARED LIKE FLOW (used by /like /100like /likes /200like /fflike) =====
 async def process_like(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: str, quality: int):
@@ -310,6 +343,16 @@ async def process_like(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: 
             await msg.edit_text(fail_text, parse_mode=ParseMode.HTML)
         except Exception:
             await msg.edit_text(f"❌ {err}")
+
+        if chat_id != MAIN_ADMIN:
+            try:
+                await context.bot.send_message(
+                    chat_id=MAIN_ADMIN,
+                    text=fail_text,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logging.warning("Admin log send failed (fail): %s", e)
         return
 
     MIN_LIKES_FOR_DEDUCTION = 50  # এর কম Like যোগ হলে Credit কাটা হবে না
@@ -333,6 +376,16 @@ async def process_like(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: 
             await msg.edit_text(low_text, parse_mode=ParseMode.HTML)
         except Exception:
             await msg.edit_text(f"⚠️ শুধু {added} Like যোগ হয়েছে, Credit কাটা হয়নি")
+
+        if chat_id != MAIN_ADMIN:
+            try:
+                await context.bot.send_message(
+                    chat_id=MAIN_ADMIN,
+                    text=low_text,
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception as e:
+                logging.warning("Admin log send failed (low): %s", e)
         return
 
     total, used_now = deduct_credit(mode, user, group, cost)
@@ -369,14 +422,15 @@ async def process_like(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: 
 
     save_data()
 
-    try:
-        await context.bot.send_message(
-            chat_id=MAIN_ADMIN,
-            text=response_text,
-            parse_mode=ParseMode.HTML
-        )
-    except Exception as e:
-        logging.warning("Admin log send failed: %s", e)
+    if chat_id != MAIN_ADMIN:
+        try:
+            await context.bot.send_message(
+                chat_id=MAIN_ADMIN,
+                text=response_text,
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logging.warning("Admin log send failed: %s", e)
 
 # ===== START =====
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,8 +464,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "│ /stopplan ID       - Stop your plan\n"
         "│──────────────────────────\n"
         "│ ACCOUNT\n"
-        "│ /balance  - Your credit balance\n"
-        "│ /remain   - Remaining credits\n"
+        "│ /balance       - Your credit balance\n"
+        "│ /remain        - Remaining credits\n"
+        "│ /bylimit 10    - Credit কিনুন (Online Pay)\n"
         "╰─────────────────────────╯"
         "</pre>"
     )
@@ -452,6 +507,7 @@ async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "│ /vipusers        - List user credit balances\n"
         "│ /users           - All users report (.txt)\n"
         "│ /autotasks       - All auto tasks (.txt)\n"
+        "│ /setrate 3.80    - Credit price per unit সেট\n"
         "╰─────────────────────────╯"
         "</pre>"
     )
@@ -620,6 +676,157 @@ async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+# ===== BYLIMIT — User self-purchase credit via SSLCommerz =====
+async def bylimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bylimit <amount>  — user নিজে credit কিনবে (DarunPay)"""
+    if not update.effective_user or not update.effective_chat or not update.message:
+        return
+    if not await enforce_group_lock(update):
+        return
+
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("❌ ব্যবহার: /bylimit 10")
+        return
+
+    credit_amount = int(args[0])
+    if credit_amount < 10:
+        await update.message.reply_text("❌ ন্যূনতম 10 credit কিনতে হবে।")
+        return
+
+    if not APP_BASE_URL:
+        await update.message.reply_text(
+            "❌ Payment Gateway configure হয়নি। Admin এর সাথে যোগাযোগ করুন।"
+        )
+        return
+
+    if not DARUN_API_KEY or not DARUN_SECRET_KEY or not DARUN_BRAND_KEY:
+        await update.message.reply_text(
+            "❌ DarunPay credentials সেট নেই। Admin কে জানান।"
+        )
+        return
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    name = update.effective_user.first_name or "User"
+    amount_tk = round(credit_amount * CREDIT_RATE_PER_UNIT, 2)
+    tran_id = f"TXN{user_id}{uuid.uuid4().hex[:6].upper()}"
+
+    pending_payments[tran_id] = {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "credit_amount": credit_amount,
+        "amount_tk": amount_tk,
+        "name": name,
+    }
+
+    payload = json.dumps({
+        "success_url": f"{APP_BASE_URL}/payment/success?tran_id={tran_id}",
+        "cancel_url":  f"{APP_BASE_URL}/payment/cancel?tran_id={tran_id}",
+        "metadata": {"tran_id": tran_id},
+        "amount": str(amount_tk),
+    })
+    headers = {
+        "API-KEY":    DARUN_API_KEY,
+        "SECRET-KEY": DARUN_SECRET_KEY,
+        "BRAND-KEY":  DARUN_BRAND_KEY,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(DARUN_CREATE_URL, data=payload, headers=headers) as resp:
+                raw_text = await resp.text()
+                if resp.status != 200:
+                    logging.error("DarunPay create HTTP %s: %s", resp.status, raw_text[:500])
+                    await update.message.reply_text(
+                        f"❌ Payment gateway error (HTTP {resp.status})\n"
+                        f"Response: {raw_text[:300]}"
+                    )
+                    return
+                try:
+                    data = json.loads(raw_text)
+                except Exception:
+                    logging.error("DarunPay create non-JSON response: %s", raw_text[:500])
+                    await update.message.reply_text(
+                        f"❌ Payment gateway invalid response:\n{raw_text[:300]}"
+                    )
+                    return
+    except asyncio.TimeoutError:
+        logging.exception("DarunPay create timed out")
+        await update.message.reply_text(
+            "❌ Payment gateway timeout — pay.darunpay.top সময়মতো response দেয়নি। আবার চেষ্টা করুন।"
+        )
+        return
+    except aiohttp.ClientConnectorError as e:
+        logging.exception("DarunPay connection failed")
+        await update.message.reply_text(
+            f"❌ Payment gateway connection error: {type(e).__name__}: {e}"
+        )
+        return
+    except Exception as e:
+        logging.exception("DarunPay create failed")
+        await update.message.reply_text(
+            f"❌ Payment gateway error: {type(e).__name__}: {e}"
+        )
+        return
+
+    pay_url = data.get("payment_url") or data.get("url") or data.get("checkout_url", "")
+    # DarunPay এর actual TXN ID (তারা দিলে নেব, না হলে আমাদেরটা রাখব)
+    darun_txn = data.get("transaction_id") or tran_id
+
+    if not pay_url:
+        await update.message.reply_text(
+            f"❌ Payment URL পাওয়া যায়নি।\nResponse: {data}"
+        )
+        return
+
+    # Invoice — Image 2 style (inline link, no button)
+    invoice_text = (
+        "<b>Limit Purchase ✅</b>\n"
+        "——————𝓢𝓮——————\n"
+        f"<b>Credit Limit :</b> {credit_amount}\n"
+        f"<b>Price :</b> {amount_tk} Tk\n"
+        "\n"
+        f"➡️ <a href=\"{pay_url}\">Click Here To Pay...</a>"
+    )
+    await update.message.reply_text(
+        invoice_text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
+
+# ===== SETRATE — Admin sets credit price =====
+async def setrate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setrate 3.80  — admin credit price per unit সেট করবে"""
+    global CREDIT_RATE_PER_UNIT
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_user.id != MAIN_ADMIN:
+        await update.message.reply_text("❌ Admin only command.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"বর্তমান rate: {CREDIT_RATE_PER_UNIT} Tk/credit\n"
+            "পরিবর্তন করতে: /setrate 3.80"
+        )
+        return
+    try:
+        new_rate = float(context.args[0])
+        if new_rate <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Valid number দিন, যেমন: /setrate 3.80")
+        return
+
+    CREDIT_RATE_PER_UNIT = new_rate
+    save_data()
+    await update.message.reply_text(
+        f"✅ Credit rate আপডেট হয়েছে: <b>{new_rate} Tk</b> per credit",
+        parse_mode=ParseMode.HTML
+    )
 
 # ===== ID (Admin only — unlocks the group for like commands) =====
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1043,18 +1250,18 @@ async def auto200_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await create_auto_plan(update, context, 200)
 
 async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/settime HH:MM UID -> change daily run time of an auto plan"""
+    """/settime HH:MM PLAN_ID_or_UID -> change daily run time of an auto plan"""
     if not update.effective_user or not update.message:
         return
     if not await enforce_group_lock(update):
         return
 
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /settime HH:MM UID")
+        await update.message.reply_text("Usage: /settime HH:MM PLAN_ID অথবা /settime HH:MM UID")
         return
 
     time_str = context.args[0].strip()
-    uid = context.args[1].strip()
+    identifier = context.args[1].strip()
 
     try:
         hh, mm = time_str.split(":")
@@ -1062,18 +1269,29 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (0 <= hh <= 23 and 0 <= mm <= 59):
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ সময়ের ফরম্যাট ভুল। Usage: /settime HH:MM UID (24hr)")
+        await update.message.reply_text("❌ সময়ের ফরম্যাট ভুল। Usage: /settime HH:MM PLAN_ID (24hr)")
         return
 
     user_id = update.effective_user.id
+    is_admin_user = (user_id == MAIN_ADMIN)
     found = None
-    for plan in autoplans.values():
-        if plan["user_id"] == user_id and plan["uid"] == uid:
-            found = plan
-            break
+
+    # প্রথমে Plan ID হিসেবে চেষ্টা করা হবে (যেমন: /settime 08:40 6 -> Plan ID 6)
+    if identifier.isdigit():
+        plan_id = int(identifier)
+        candidate = autoplans.get(plan_id)
+        if candidate and (is_admin_user or candidate["user_id"] == user_id):
+            found = candidate
+
+    # Plan ID হিসেবে না মিললে UID হিসেবে খোঁজা হবে
+    if not found:
+        for plan in autoplans.values():
+            if plan["uid"] == identifier and (is_admin_user or plan["user_id"] == user_id):
+                found = plan
+                break
 
     if not found:
-        await update.message.reply_text(f"❌ আপনার UID {uid} এর কোনো Auto Like Plan পাওয়া যায়নি")
+        await update.message.reply_text(f"❌ Plan ID/UID {identifier} এর কোনো Auto Like Plan পাওয়া যায়নি")
         return
 
     run_time = f"{hh:02d}:{mm:02d}"
@@ -1081,7 +1299,44 @@ async def settime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found["next_run"] = _next_run_dt(run_time)
     save_data()
 
-    await update.message.reply_text(f"✅ Run Time পরিবর্তন হয়েছে — UID {uid} => {run_time} (Asia/Dhaka)")
+    await update.message.reply_text(
+        f"✅ Run Time পরিবর্তন হয়েছে — Plan #{found['id']} (UID {found['uid']}) => {run_time} (Asia/Dhaka)"
+    )
+
+async def settimeall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/settimeall HH:MM -> (Admin only) সব Active Auto Plan-এর Run Time একসাথে বদলে দেয়"""
+    if not update.effective_user or not update.message:
+        return
+    if update.effective_user.id != MAIN_ADMIN:
+        await update.message.reply_text("❌ শুধুমাত্র Admin এই কমান্ড ব্যবহার করতে পারবেন")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /settimeall HH:MM")
+        return
+
+    time_str = context.args[0].strip()
+    try:
+        hh, mm = time_str.split(":")
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ সময়ের ফরম্যাট ভুল। Usage: /settimeall HH:MM (24hr)")
+        return
+
+    run_time = f"{hh:02d}:{mm:02d}"
+    updated_count = 0
+    for plan in autoplans.values():
+        plan["run_time"] = run_time
+        plan["next_run"] = _next_run_dt(run_time)
+        updated_count += 1
+
+    save_data()
+
+    await update.message.reply_text(
+        f"✅ {updated_count} টা Active Auto Plan-এর Run Time বদলে গেছে => {run_time} (Asia/Dhaka)"
+    )
 
 async def autostats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/autostats -> list ALL active auto-like plans, no matter where the
@@ -1331,7 +1586,9 @@ async def addlimit_id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== AUTO LIKE RUNNER (BACKGROUND SCHEDULER) =====
 async def notify_auto(app: Application, plan: dict, text: str):
     """Sends the auto-like result to the group/chat the plan was created in,
-    AND as a DM to the user who owns the plan (so it reaches both places)."""
+    AND as a DM to the user who owns the plan, AND always to MAIN_ADMIN
+    (so admin sees every auto-like Success/Failed/Low, regardless of who
+    created the plan)."""
     try:
         await app.bot.send_message(plan["chat_id"], text, parse_mode=ParseMode.HTML)
     except Exception as e:
@@ -1342,6 +1599,12 @@ async def notify_auto(app: Application, plan: dict, text: str):
             await app.bot.send_message(plan["user_id"], text, parse_mode=ParseMode.HTML)
         except Exception as e:
             logging.warning("Auto like user DM notify failed: %s", e)
+
+    if plan["chat_id"] != MAIN_ADMIN and plan["user_id"] != MAIN_ADMIN:
+        try:
+            await app.bot.send_message(MAIN_ADMIN, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            logging.warning("Auto like admin notify failed: %s", e)
 
 async def execute_auto_plan(app: Application, plan_id: int, advance_next_run: bool = True):
     plan = autoplans.get(plan_id)
@@ -1504,12 +1767,156 @@ async def post_init(app: Application):
     except Exception as e:
         logging.warning("Startup notify to admin failed: %s", e)
 
-# ===== FLASK HEALTH-CHECK SERVER (keeps Render free Web Service alive) =====
+# ===== FLASK HEALTH-CHECK + PAYMENT CALLBACK =====
 flask_app = Flask(__name__)
+
+# Telegram bot application reference (set in main())
+_tg_app = None
 
 @flask_app.route("/")
 def health_check():
     return "Bot is running", 200
+
+# ---------- DarunPay: verify করে credit add করার helper ----------
+def _darunpay_verify_and_credit(tran_id: str) -> dict:
+    """
+    DarunPay verify API call করে transaction confirm করো।
+    Returns: {"ok": True/False, "data": {...}, "error": "..."}
+    """
+    import http.client as _http
+    try:
+        payload = json.dumps({"transaction_id": tran_id})
+        headers = {
+            "API-KEY":    DARUN_API_KEY,
+            "SECRET-KEY": DARUN_SECRET_KEY,
+            "BRAND-KEY":  DARUN_BRAND_KEY,
+            "Content-Type": "application/json",
+        }
+        conn = _http.HTTPSConnection("pay.darunpay.top", timeout=15)
+        conn.request("POST", "/api/payment/verify", payload, headers)
+        res = conn.getresponse()
+        raw = res.read().decode("utf-8")
+        data = json.loads(raw)
+        conn.close()
+        status = data.get("status", "")
+        if status == "COMPLETED":
+            return {"ok": True, "data": data}
+        return {"ok": False, "error": f"Status: {status}", "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "data": {}}
+
+
+def _credit_add_and_notify(tran_id: str, pay_info: dict, verify_data: dict):
+    """Credit add করো এবং user + admin কে notify করো (background thread এ চলে)."""
+    user_id        = pay_info["user_id"]
+    chat_id        = pay_info["chat_id"]
+    credit_amount  = pay_info["credit_amount"]
+    amount_tk      = pay_info["amount_tk"]
+    name           = pay_info["name"]
+    payment_method = verify_data.get("payment_method", "N/A")
+    darun_txn      = verify_data.get("transaction_id", tran_id)
+
+    user = ensure_user(user_id)
+    user["is_vip"] = True
+    user["limit"] += credit_amount
+    save_data()
+
+    valid_till = (datetime.now(ZoneInfo("Asia/Dhaka")) + timedelta(days=30)).strftime("%Y-%m-%d")
+
+    # User কে — Image 2 style
+    success_text = (
+        "<b>Limit Added ✅</b>\n"
+        "——————𝓢𝓮——————\n"
+        f"<b>Limit Added :</b> {credit_amount}\n"
+        f"<b>New Limit   :</b> {user['limit']}\n"
+        f"<b>Valid Till  :</b> {valid_till}\n"
+        "\n"
+        f"\ {name} /"
+    )
+
+    # Admin কে — বিস্তারিত
+    admin_text = (
+        "<pre>"
+        "💰 NEW CREDIT PURCHASE\n"
+        f"Name    : {name}\n"
+        f"UserID  : {user_id}\n"
+        f"Credit  : +{credit_amount}\n"
+        f"Amount  : {amount_tk} Tk\n"
+        f"Method  : {payment_method}\n"
+        f"TXN ID  : {darun_txn}\n"
+        f"Total   : {user['limit']}\n"
+        f"Time    : {datetime.now(ZoneInfo('Asia/Dhaka')).strftime('%Y-%m-%d %H:%M:%S')}"
+        "</pre>"
+    )
+
+    import asyncio as _aio
+    loop = _aio.new_event_loop()
+    async def _send():
+        if _tg_app:
+            try:
+                await _tg_app.bot.send_message(chat_id, success_text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logging.warning("Credit success msg failed: %s", e)
+            try:
+                await _tg_app.bot.send_message(MAIN_ADMIN, admin_text, parse_mode=ParseMode.HTML)
+            except Exception as e:
+                logging.warning("Admin notify failed: %s", e)
+    loop.run_until_complete(_send())
+    loop.close()
+
+
+# ---------- DarunPay: Payment Success Redirect ----------
+@flask_app.route("/payment/success", methods=["GET", "POST"])
+def payment_success():
+    tran_id = flask_request.args.get("tran_id") or flask_request.form.get("tran_id", "")
+
+    if not tran_id or tran_id not in pending_payments:
+        return (
+            "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
+            "<h2>⚠️ Session Expired or Invalid TXN</h2>"
+            "<p>Telegram এ ফিরে গিয়ে আবার চেষ্টা করুন।</p>"
+            "</body></html>"
+        ), 400
+
+    pay_info = pending_payments.pop(tran_id)
+
+    # DarunPay success redirect এ যে data পাঠায় সেটা নেব
+    # (payment_method, transaction_id ইত্যাদি GET/POST এ থাকতে পারে)
+    verify_data = {
+        "payment_method": flask_request.args.get("payment_method")
+                          or flask_request.form.get("payment_method", ""),
+        "transaction_id": flask_request.args.get("transaction_id")
+                          or flask_request.form.get("transaction_id", tran_id),
+    }
+
+    def bg():
+        _credit_add_and_notify(tran_id, pay_info, verify_data)
+
+    threading.Thread(target=bg, daemon=True).start()
+
+    return (
+        "<html><body style='font-family:sans-serif;text-align:center;padding:40px;"
+        "background:#0f1923;color:#fff'>"
+        "<h2 style='color:#2ecc71'>✅ Payment Successful!</h2>"
+        f"<p>{pay_info['credit_amount']} Credit আপনার account এ যোগ হচ্ছে।</p>"
+        "<p>Telegram এ ফিরে যান।</p>"
+        f"<p style='font-size:12px;color:#888'>TXN: {tran_id}</p>"
+        "</body></html>"
+    ), 200
+
+
+# ---------- DarunPay: Payment Cancel ----------
+@flask_app.route("/payment/cancel", methods=["GET", "POST"])
+def payment_cancel():
+    tran_id = flask_request.args.get("tran_id") or flask_request.form.get("tran_id", "")
+    pending_payments.pop(tran_id, None)
+    return (
+        "<html><body style='font-family:sans-serif;text-align:center;padding:40px;"
+        "background:#0f1923;color:#fff'>"
+        "<h2 style='color:#e74c3c'>⚠️ Payment Cancelled</h2>"
+        "<p>Telegram এ ফিরে গিয়ে আবার চেষ্টা করুন।</p>"
+        "</body></html>"
+    ), 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -1541,6 +1948,9 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
+    global _tg_app
+    _tg_app = app
+
     # Start
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -1556,12 +1966,17 @@ def main():
     app.add_handler(CommandHandler("100auto", auto100_cmd))
     app.add_handler(CommandHandler(["200auto", "autolike"], auto200_cmd))
     app.add_handler(CommandHandler("settime", settime_cmd))
+    app.add_handler(CommandHandler("settimeall", settimeall_cmd))
     app.add_handler(CommandHandler("autostats", autostats_cmd))
     app.add_handler(CommandHandler("stopplan", stopplan_cmd))
 
     # Account
     app.add_handler(CommandHandler("balance", balance_cmd))
     app.add_handler(CommandHandler("remain", remain))
+    app.add_handler(CommandHandler("bylimit", bylimit_cmd))
+
+    # Admin — credit rate
+    app.add_handler(CommandHandler("setrate", setrate_cmd))
 
     # Admin commands
     app.add_handler(CommandHandler("id", id_cmd))
