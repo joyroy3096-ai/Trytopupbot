@@ -24,7 +24,7 @@ logging.basicConfig(
 
 # ===== CONFIG =====
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-MAIN_ADMIN = 7375002067 
+MAIN_ADMIN = 6316410400
 
 # ===== LIKE API ENDPOINTS =====
 # আগে একটাই fixed URL ("https://topupgang.com/like") ব্যবহার হতো, যেটা
@@ -36,8 +36,8 @@ API_URL_200 = "https://topupgang.com/api/like200"
 # Separate API keys per like tier.
 # API_KEY_100 -> used for /like, /100like, /100auto  (100 Like)
 # API_KEY_200 -> used for /likes, /200like, /200auto, /autolike (200 Like)
-API_KEY_100 = "JGS-977A6772FF920F52"
-API_KEY_200 = "JGS-977A6772FF920F52"
+API_KEY_100 = "JGS-6FB36D535A3099A8"
+API_KEY_200 = "JGS-6FB36D535A3099A8"
 
 REGION = "BD"
 DEFAULT_AUTO_TIME = "09:00"   # default daily run time for auto-like plans (Asia/Dhaka)
@@ -199,7 +199,7 @@ def is_admin(user_id: int) -> bool:
 
 GROUP_LOCKED_MESSAGE = (
     "🔒 এই গ্রুপে বট এখনো Unlock করা হয়নি।\n"
-    "ব্যবহার করতে Admin এর সাথে যোগাযোগ করুন: https://t.me/Itzfuadd"
+    "ব্যবহার করতে Admin এর সাথে যোগাযোগ করুন: https://t.me/rikspolash"
 )
 
 async def enforce_group_lock(update: Update) -> bool:
